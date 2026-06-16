@@ -6,9 +6,9 @@ import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from google import genai
-from google.genai import errors as genai_errors
-from google.genai import types
+import google.generativeai as genai
+import google.ai.generativelanguage as glm
+from google.api_core import exceptions as api_exceptions
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -312,46 +312,50 @@ class KeyRotator:
             raise RuntimeError(
                 "No Gemini API keys found. Set GEMINI_API_KEY or GEMINI_API_KEY_1, GEMINI_API_KEY_2, …"
             )
-        self._clients = [genai.Client(api_key=k) for k in keys]
+        self._keys = keys
         self._index = 0
-        logger.info("KeyRotator initialised with %d key(s).", len(self._clients))
+        logger.info("KeyRotator initialised with %d key(s).", len(self._keys))
 
     def rotate(self) -> bool:
-        next_index = (self._index + 1) % len(self._clients)
+        next_index = (self._index + 1) % len(self._keys)
         if next_index == self._index:
             return False
         self._index = next_index
         logger.warning("Rotated to Gemini key #%d.", self._index + 1)
         return True
 
-    def generate_with_rotation(self, contents: list) -> object:
+    def generate_with_rotation(self, images: list[bytes], prompt: str) -> object:
         start = self._index
         attempt = 0
         while True:
             try:
-                client = self._clients[self._index]
-                chat = client.chats.create(
-                    model="gemini-2.5-flash-image",
-                    config=types.GenerateContentConfig(
-                        response_modalities=["TEXT", "IMAGE"]
+                genai.configure(api_key=self._keys[self._index])
+                model = genai.GenerativeModel(
+                    model_name="gemini-2.0-flash-exp-image-generation",
+                    generation_config=genai.GenerationConfig(
+                        response_modalities=["IMAGE", "TEXT"],
                     ),
                 )
-                return chat.send_message(contents)
-            except genai_errors.ClientError as exc:
-                if exc.code == 429:
-                    attempt += 1
-                    logger.warning(
-                        "Key #%d hit 429 (attempt %d). Rotating…",
-                        self._index + 1,
-                        attempt,
+                parts = [
+                    glm.Part(inline_data=glm.Blob(mime_type="image/jpeg", data=img))
+                    for img in images
+                ]
+                parts.append(glm.Part(text=prompt))
+                return model.generate_content(parts)
+            except api_exceptions.ResourceExhausted:
+                attempt += 1
+                logger.warning(
+                    "Key #%d hit 429 (attempt %d). Rotating…",
+                    self._index + 1,
+                    attempt,
+                )
+                rotated = self.rotate()
+                if not rotated or self._index == start:
+                    raise RuntimeError(
+                        f"All {len(self._keys)} Gemini key(s) are quota-exhausted."
                     )
-                    rotated = self.rotate()
-                    if not rotated or self._index == start:
-                        raise RuntimeError(
-                            f"All {len(self._clients)} Gemini key(s) are quota-exhausted."
-                        ) from exc
-                else:
-                    raise
+            except Exception:
+                raise
 
 
 _rotator: KeyRotator | None = None
@@ -632,13 +636,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("✓ الريفرانس اتسجل — بدأ الشغل... ⏳")
 
         try:
-            contents = []
-            for t_img in user_sessions[user_id]["T"]:
-                contents.append(types.Part.from_bytes(data=t_img, mime_type="image/jpeg"))
-            contents.append(types.Part.from_bytes(data=user_sessions[user_id]["R"], mime_type="image/jpeg"))
-            contents.append(types.Part.from_text(text=RENOVAI_PROMPT))
-
-            response = get_rotator().generate_with_rotation(contents)
+            all_images = list(user_sessions[user_id]["T"]) + [user_sessions[user_id]["R"]]
+            response = get_rotator().generate_with_rotation(all_images, RENOVAI_PROMPT)
 
             image_sent = False
             for part in response.candidates[0].content.parts:
