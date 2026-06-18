@@ -332,9 +332,7 @@ class KeyRotator:
                 genai.configure(api_key=self._keys[self._index])
                 model = genai.GenerativeModel(
                     model_name="gemini-2.0-flash-exp-image-generation",
-                    generation_config=genai.GenerationConfig(
-                        response_modalities=["IMAGE", "TEXT"],
-                    ),
+                    generation_config={"response_modalities": ["IMAGE", "TEXT"]},
                 )
                 parts = [
                     glm.Part(inline_data=glm.Blob(mime_type="image/jpeg", data=img))
